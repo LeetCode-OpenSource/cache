@@ -37,11 +37,34 @@ func perform(n int, cbs ...func(int)) {
 	wg.Wait()
 }
 
+type ObjectSlice []*Object
+
+func (o ObjectSlice) Len() int {
+	return len(o)
+}
+
+func (o ObjectSlice) Get(index int) interface{} {
+	return o[index]
+}
+
+func (o ObjectSlice) GetPtr(index int) interface{} {
+	if o[index] == nil {
+		o[index] = new(Object)
+	}
+
+	return &o[index]
+}
+
 var _ = Describe("Cache", func() {
 	ctx := context.TODO()
 
 	const key = "mykey"
 	var obj *Object
+
+	keys := []string{"key1", "key2", "key3"}
+	var objectSlice ObjectSlice = []*Object{
+		{Num: 1, Str: "1"}, {Num: 2, Str: "2"}, {Num: 3, Str: "3"},
+	}
 
 	var rdb *redis.Ring
 	var mycache *cache.Cache
@@ -58,6 +81,27 @@ var _ = Describe("Cache", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(mycache.Exists(ctx, key)).To(BeTrue())
+		})
+
+		It("MGets and MSets nil", func() {
+			err := mycache.MSet(&cache.MItem{
+				Keys:       keys,
+				ValueSlice: ObjectSlice(make([]*Object, 3, 3)),
+				TTL:        time.Hour,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			wanted := make([]*Object, 3)
+			missingIndices, err := mycache.MGet(ctx, keys, ObjectSlice(wanted))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(missingIndices)).To(BeZero())
+			Expect(wanted[0]).To(BeNil())
+			Expect(wanted[1]).To(BeNil())
+			Expect(wanted[2]).To(BeNil())
+
+			Expect(mycache.Exists(ctx, keys[0])).To(BeTrue())
+			Expect(mycache.Exists(ctx, keys[1])).To(BeTrue())
+			Expect(mycache.Exists(ctx, keys[2])).To(BeTrue())
 		})
 
 		It("Deletes key", func() {
@@ -94,6 +138,32 @@ var _ = Describe("Cache", func() {
 			Expect(wanted).To(Equal(obj))
 
 			Expect(mycache.Exists(ctx, key)).To(BeTrue())
+		})
+
+		It("MGets and MSets data", func() {
+			if rdb == nil {
+				return
+			}
+
+			err := mycache.MSet(&cache.MItem{
+				Ctx:        ctx,
+				Keys:       keys[:2],
+				ValueSlice: objectSlice[:2],
+				TTL:        time.Hour,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			wanted := make([]*Object, 3)
+			missingIndices, err := mycache.MGet(ctx, keys, ObjectSlice(wanted))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(missingIndices)).To(Equal(1))
+			Expect(wanted[0]).To(Equal(objectSlice[0]))
+			Expect(wanted[1]).To(Equal(objectSlice[1]))
+			Expect(wanted[2]).To(BeNil())
+
+			Expect(mycache.Exists(ctx, keys[0])).To(BeTrue())
+			Expect(mycache.Exists(ctx, keys[1])).To(BeTrue())
+			Expect(mycache.Exists(ctx, keys[2])).To(BeFalse())
 		})
 
 		It("Sets string as is", func() {
