@@ -37,6 +37,7 @@ type rediser interface {
 
 	Get(ctx context.Context, key string) *redis.StringCmd
 	Del(ctx context.Context, keys ...string) *redis.IntCmd
+	Pipeline() redis.Pipeliner
 }
 
 type Item struct {
@@ -88,6 +89,53 @@ func (item *Item) ttl() time.Duration {
 		return time.Hour
 	}
 	return item.TTL
+}
+
+type ValueSlice interface {
+	Len() int
+
+	// Get return the value at index which will be set into cache.
+	Get(index int) interface{}
+	// GetPtr return the pointer of non-nil value at index
+	// which will be unmarshalled from value.
+	GetPtr(index int) interface{}
+}
+
+type MItem struct {
+	Ctx context.Context
+
+	Keys []string
+	// ValueSlice is value slice whose length is equal to length of keys.
+	ValueSlice ValueSlice
+
+	// TTL is the cache expiration time.
+	// Default TTL is 1 hour.
+	TTL time.Duration
+}
+
+func (mItem *MItem) Context() context.Context {
+	if mItem.Ctx == nil {
+		return context.Background()
+	}
+	return mItem.Ctx
+}
+
+func (mItem *MItem) valueSlice() (ValueSlice, error) {
+	if mItem.ValueSlice != nil {
+		return mItem.ValueSlice, nil
+	}
+	return nil, nil
+}
+
+func (mItem *MItem) ttl() time.Duration {
+	if mItem.TTL < 0 {
+		return 0
+	}
+	if mItem.TTL != 0 && mItem.TTL < time.Second {
+		log.Printf("too short TTL for keys=%q: %s", mItem.Keys, mItem.TTL)
+		return time.Hour
+	}
+	return mItem.TTL
 }
 
 //------------------------------------------------------------------------------
@@ -270,6 +318,161 @@ func (cd *Cache) getSetItemBytesOnce(item *Item) (b []byte, cached bool, err err
 		return nil, false, err
 	}
 	return v.([]byte), cached, nil
+}
+
+// MSet caches the mItem.
+func (cd *Cache) MSet(mItem *MItem) error {
+	return cd.mSet(mItem)
+}
+
+func (cd *Cache) mSet(mItem *MItem) error {
+	valueSlice, err := mItem.valueSlice()
+	if err != nil {
+		return err
+	}
+	if len(mItem.Keys) != valueSlice.Len() {
+		return errors.New("length of keys and values is not equal")
+	}
+
+	var pipeline redis.Pipeliner
+	if cd.opt.Redis != nil {
+		pipeline = cd.opt.Redis.Pipeline()
+	}
+
+	ctx, ttl := mItem.Context(), mItem.ttl()
+	for i, key := range mItem.Keys {
+		value := valueSlice.Get(i)
+		bytes, err := cd.Marshal(value)
+		if err != nil {
+			return err
+		}
+
+		if cd.opt.LocalCache != nil {
+			cd.opt.LocalCache.Set(key, bytes)
+		}
+
+		if pipeline != nil {
+			pipeline.Set(ctx, key, bytes, ttl)
+		}
+	}
+
+	if pipeline != nil {
+		_, err = pipeline.Exec(ctx)
+	}
+
+	return err
+}
+
+// MGet gets the value for the given key.
+func (cd *Cache) MGet(ctx context.Context, keys []string, valueSlice ValueSlice) (map[int]string, error) {
+	return cd.mGet(ctx, keys, valueSlice, false)
+}
+
+// MGetSkippingLocalCache gets the value for the given key skipping local cache.
+func (cd *Cache) MGetSkippingLocalCache(
+	ctx context.Context, keys []string, valueSlice ValueSlice,
+) (map[int]string, error) {
+	return cd.mGet(ctx, keys, valueSlice, true)
+}
+
+func (cd *Cache) mGet(
+	ctx context.Context,
+	keys []string,
+	valueSlice ValueSlice,
+	skipLocalCache bool,
+) (map[int]string, error) {
+	byteSlices, missingIndexMap, err := cd.mGetBytes(ctx, keys, skipLocalCache)
+	if err != nil {
+		return nil, err
+	}
+
+	for i, byteSlice := range byteSlices {
+		// Only unmarshal when key isn't missing
+		if _, exists := missingIndexMap[i]; !exists {
+			value := valueSlice.GetPtr(i)
+			if err := cd.Unmarshal(byteSlice, value); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return missingIndexMap, nil
+}
+
+func (cd *Cache) mGetBytes(ctx context.Context, keys []string, skipLocalCache bool) ([][]byte, map[int]string, error) {
+	byteSlices := make([][]byte, len(keys))
+
+	// Get bytes from local cache
+	var absentKeys []string
+	var absentIndices []int
+	if !skipLocalCache && cd.opt.LocalCache != nil {
+		for i, key := range keys {
+			byteSlice, ok := cd.opt.LocalCache.Get(key)
+			if ok {
+				byteSlices[i] = byteSlice
+			} else {
+				absentKeys = append(absentKeys, key)
+				absentIndices = append(absentIndices, i)
+			}
+		}
+
+		if len(absentKeys) == 0 {
+			return byteSlices, nil, nil
+		}
+	} else {
+		absentKeys = keys
+		absentIndices = make([]int, len(keys))
+		for i := range absentIndices {
+			absentIndices[i] = i
+		}
+	}
+
+	if cd.opt.Redis == nil {
+		if cd.opt.LocalCache == nil {
+			return nil, nil, errRedisLocalCacheNil
+		}
+		return nil, nil, ErrCacheMiss
+	}
+
+	// Get absent bytes from redis
+	pipeline := cd.opt.Redis.Pipeline()
+	cmds := make([]*redis.StringCmd, len(absentKeys))
+	for i, key := range absentKeys {
+		cmds[i] = pipeline.Get(ctx, key)
+	}
+	_, err := pipeline.Exec(ctx)
+	if err != nil && err != redis.Nil {
+		return nil, nil, err
+	}
+
+	// Fill absent bytes and record missing key indices
+	missingIndexMap := make(map[int]string)
+	for i, index := range absentIndices {
+		byteSlices[index], err = cmds[i].Bytes()
+		if err == redis.Nil {
+			missingIndexMap[index] = keys[index]
+			continue
+		}
+		if err != nil {
+			if cd.opt.StatsEnabled {
+				atomic.AddUint64(&cd.hits, uint64(i-len(missingIndexMap)))
+				atomic.AddUint64(&cd.misses, uint64(len(missingIndexMap)+1))
+			}
+
+			return nil, nil, err
+		}
+
+		if !skipLocalCache && cd.opt.LocalCache != nil {
+			cd.opt.LocalCache.Set(absentKeys[index], byteSlices[index])
+		}
+	}
+
+	if cd.opt.StatsEnabled {
+		atomic.AddUint64(&cd.hits, uint64(len(absentIndices)-len(missingIndexMap)))
+		atomic.AddUint64(&cd.misses, uint64(len(missingIndexMap)))
+	}
+
+	return byteSlices, missingIndexMap, nil
 }
 
 func (cd *Cache) Delete(ctx context.Context, key string) error {
